@@ -1,0 +1,42 @@
+# FUNC_NAME|INJECT_IDXS (VULN Inject point. this is comma separated)
+
+
+unserialize|1
+# ==== NEED TO SET VULN INJECT POINT NUMBERS!! ====
+copy|1
+file_exists|1
+file_get_contents|1
+file_put_contents|1
+file|1
+fileatime|1
+filectime|1
+filegroup|1
+fileinode|1
+filemtime|1
+fileowner|1
+fileperms|1
+filesize|1
+filetype|1
+fopen|1
+is_dir|1
+is_executable|1
+is_file|1
+is_link|1
+is_readable|1
+is_writable|1
+lstat|1
+mkdir|1
+parse_ini_file|1
+readfile|1
+rename|1
+rmdir|1
+stat|1
+touch|1
+unlink|1
+md5_file|1
+sha1_file|1
+getimagesize|1
+
+
+# ========= THIS IS NOT FUNCCALL =========
+# include|1

@@ -1,0 +1,821 @@
+<?php
+class Executor {
+  public $class_info = array();
+  public $input_tree;
+  public $payload_file_contents = "<?php\n";
+  public $file_inst;
+  public $serialized_string;
+  public $rabbitmq_output;
+
+  function ExecutePutByPayloadTree($file_inst, $file_chain, $payload_tree,
+                                   $rabbitmq_settings, $rabbitmq_connection,
+                                   $entry_magic_method, $target_chain) {
+    $this->file_chain = $file_chain;
+    $this->file_inst = $file_inst;
+    $this->input_tree = $payload_tree;
+    $this->inst_file_path = dirname(realpath($this->file_inst)) . "/";
+    $this->inst_file_name = microtime(true) * 10000 . "_" .
+                            basename($this->file_chain , ".php" ) . ".php";
+    if (!file_exists($this->inst_file_path . "PAYLOAD")) {
+      mkdir($this->inst_file_path . "PAYLOAD");
+    }
+
+    $this->file_output = $this->MakePayloadPhpFile($target_chain);
+
+    $this->serialized_string = shell_exec(
+      "php " .
+      "-d max_execution_time=" . $GLOBALS['FUZZING_TIMEOUT'] . " " .
+      "-d memory_limit=" . MEMORY_LIMIT . " " .
+      $this->file_output
+    );
+    if ($this->serialized_string == NULL) {
+      $output['status'] = FALSE;
+      $output['file_output'] = $this->file_output;
+      $output['result'] = NULL;
+      return $output;
+    }
+
+    putenv("RABBITMQ_IP=" . $rabbitmq_settings['ip']);
+    putenv("RABBITMQ_PORT=" . $rabbitmq_settings['port']);
+    putenv("RABBITMQ_ID=" . $rabbitmq_settings['id']);
+    putenv("RABBITMQ_PASSWORD=" . $rabbitmq_settings['password']);
+    putenv("RABBITMQ_CHANNEL=" . $rabbitmq_settings['channel']);
+    putenv("ENTRY_MAGIC_METHOD=" . $entry_magic_method);
+    putenv("SEED_VALUE=" . $GLOBALS['SEED_VALUE']);
+    shell_exec("php " .
+               "-d max_execution_time=" . $GLOBALS['FUZZING_TIMEOUT'] . " " .
+               "-d memory_limit=" . MEMORY_LIMIT . " " .
+               $file_inst . " " . $this->serialized_string);
+    putenv("RABBITMQ_IP=None");
+    putenv("RABBITMQ_PORT=None");
+    putenv("RABBITMQ_ID=None");
+    putenv("RABBITMQ_PASSWORD=None");
+    putenv("RABBITMQ_CHANNEL=None");
+    putenv("ENTRY_MAGIC_METHOD=None");
+    putenv("SEED_VALUE=None");
+
+    $channel = $rabbitmq_connection->channel();
+    $channel->queue_declare($rabbitmq_settings['channel'], false, false, false, true);
+    $channel->basic_consume(
+      $rabbitmq_settings['channel'],
+      '', false, true, false, false,
+      array($this, 'RabbitMQCallBack')
+    );
+    while (count($channel->callbacks)) {
+      try {
+        $channel->wait(null, false, 10);
+      }
+      catch (\PhpAmqpLib\Exception\AMQPTimeoutException $e) {
+        // Pass
+      }
+      $channel->close();
+    }
+
+    $output['status'] = TRUE;
+    $output['file_output'] = $this->file_output;
+    $output['result'] = unserialize($this->rabbitmq_output);
+
+    return $output;
+  }
+
+  function RabbitMQCallBack($msg) {
+    $this->rabbitmq_output = $msg->body;
+  }
+
+  function FindMethodHash($goal_path, $class_name, $method_name) {
+    foreach ($goal_path as $goal) {
+      if ($goal['type'] == "Method" and
+          $goal['class'] == $class_name and
+          $goal['method'] == $method_name) {
+        return $goal['hash'];
+      }
+    }
+  }
+
+  function AnalyzeExecutedResult($fuzz_result, $chain, $input_seed) {
+    $goal_depth = $input_seed->goal_depth + 1;
+    $goal_gadgets = array();
+    $intended_reach = array();
+    $passed_gadgets = array(
+      "sink_executed" => False,
+      "gadget_pass_check" => array(),
+      "sink_branch" => array(),
+      "passed_conds" => array(),
+      "array_fetch_list" => array(),
+    );
+
+    if (count($chain) == $goal_depth) {
+      // Trying to reach next gadget after executing sink function.
+      $goal_depth = $goal_depth - 1;
+    }
+
+    for ($i = 0; $i <= $goal_depth; $i++) {
+      $goal_gadgets[$i] = array(
+        "class" => $chain[$i]->real_class,
+        "method" => $chain[$i]->method,
+        "hash" => $this->FindMethodHash($fuzz_result['goalPath'],
+                                        $chain[$i]->real_class,
+                                        $chain[$i]->method)
+      );
+    }
+
+    $sink_executed = False;
+    $sink_class = end($chain)->real_class;
+    $sink_method = end($chain)->method;
+    $sink_func = end($chain)->sink;
+    $sink_type = end($chain)->type;
+    $sink_index = end($chain)->order;
+
+    foreach ($fuzz_result['branchHit'] as $branch) {
+      if ($branch['type'] == "ArrayFetch") {
+        $array_hash = $branch['hash'];
+        $array_info = $branch['argvs'];
+        $array_fetch = array($array_hash => $array_info);
+        array_push($passed_gadgets['array_fetch_list'], $array_fetch);
+        continue;
+      }
+
+      if (strlen($branch['type']) >= 5 and
+          substr($branch['type'], 0, 5) == "COND-") {
+        $passed_gadgets['passed_conds'][$branch['hash']][] = $branch['type'];
+        continue;
+      }
+
+      if ($sink_type == "FuncCall" and
+          substr($branch['type'], 0, 5) == "FUNC(" and
+          substr($branch['type'], -(4+strlen($sink_func))) ==
+                 ")-" . $sink_func . "-" . $sink_index) {
+
+        $sink_depth = 0;
+        $sink_call_stack_check = false;
+        foreach (array_reverse($branch['call_stack']) as $sink_call_stack) {
+          /* Continue twice (funcWrapped) */
+          // if ($sink_call_stack_pass_flag == true) {
+          //   $sink_call_stack_pass_flag = false;
+          //   continue;
+          // }
+          // if (!(empty($sink_call_stack['class'])) and
+          //     $sink_call_stack['class'] == "ConstraintFeedback" and
+          //     $sink_call_stack['function'] == "funcWrapped") {
+          //   $sink_call_stack_pass_flag = true;
+          //   continue;
+          // }
+          /* --------------------------- */
+          if (empty($sink_call_stack['class'])) {
+            $sink_call_stack_class = '';
+          }
+          else {
+            $sink_call_stack_class = $sink_call_stack['class'];
+          }
+          // if ($sink_call_stack_check == True and
+          if ($sink_call_stack_class == $chain[$sink_depth]->real_class and
+              $sink_call_stack['function'] == $chain[$sink_depth]->method) {
+            $sink_depth += 1;
+            // $sink_call_stack_check = True;
+          }
+          // else {
+            // $sink_call_stack_check = False;
+            // continue;
+          // }
+          // $sink_depth += 1;
+          // if ($sink_depth > count($chain) - 1) {
+          //   $sink_call_stack_check = False;
+          //   break;
+          // }
+          if ($sink_depth == count($chain) - 1) {
+            $sink_call_stack_check = True;
+            break;
+          }
+        }
+        if ($sink_call_stack_check) {
+          array_push($passed_gadgets['sink_branch'], $branch);
+          if ($input_seed->goal_depth == count($chain)-1) {
+            $sink_executed = True;
+          }
+        }
+      }
+      // and substr($branch['type'], -(2+strlen($sink_func))) == "::" . $sink_func
+      elseif ($sink_type == "MethodCall" and
+              substr($branch['type'], 0, 7) == "METHOD(" and
+              substr($branch['type'], 7, strlen($sink_class)) == $sink_class and
+              substr($branch['type'], 7 + 2 + strlen($sink_class),
+                     strlen($sink_method)) == $sink_method and
+              substr($branch['type'], -(2+strlen($sink_func))) =="::".$sink_func) {
+        $method_sink_call_stack_pass_flag = false;
+        $method_sink_call_stack_check = true;
+        $method_sink_depth = 0;
+
+        foreach (array_reverse($branch['call_stack']) as $sink_call_stack) {
+          /* Continue twice (funcWrapped) */
+          if ($method_sink_call_stack_pass_flag == true) {
+            $method_sink_call_stack_pass_flag = false;
+            continue;
+          }
+          if (!(empty($sink_call_stack['class'])) and
+              $sink_call_stack['class'] == "ConstraintFeedback" and
+              $sink_call_stack['function'] == "funcWrapped") {
+            $method_sink_call_stack_pass_flag = true;
+            continue;
+          }
+          /* --------------------------- */
+
+          if (empty($sink_call_stack['class'])) {
+            $sink_call_stack_class = '';
+          }
+          else {
+            $sink_call_stack_class = $sink_call_stack['class'];
+          }
+          if ($method_sink_call_stack_check == True and
+              $sink_call_stack_class == $chain[$method_sink_depth]->real_class and
+              $sink_call_stack['function'] == $chain[$method_sink_depth]->method) {
+            $method_sink_call_stack_check = True;
+          }
+          else {
+            $method_sink_call_stack_check = False;
+            break;
+          }
+          $method_sink_depth += 1;
+          if ($method_sink_depth > count($chain) - 1) {
+            $method_sink_call_stack_check = False;
+            break;
+          }
+        }
+        if ($method_sink_call_stack_check) {
+          array_push($passed_gadgets['sink_branch'], $branch);
+          if ($input_seed->goal_depth == count($chain)-1) {
+            $sink_executed = True;
+          }
+        }
+      }
+
+      elseif ($branch['type'] != "METHOD-ENTRY" and
+              substr($branch['type'], 0, 5) != "FUNC(") {
+        continue;
+      }
+
+      $stack = array();
+      $stack_count = 0;
+      $callstack_pass_flag = false;
+
+      foreach (array_reverse($branch['call_stack']) as $call_stack) {
+        /* Continue twice (funcWrapped) */
+        if ($callstack_pass_flag == true) {
+          $callstack_pass_flag = false;
+          continue;
+        }
+        if (!(empty($call_stack['class'])) and
+            $call_stack['class'] == "ConstraintFeedback" and
+            $call_stack['function'] == "funcWrapped") {
+          $callstack_pass_flag = true;
+          continue;
+        }
+        /* --------------------------- */
+        if ($stack_count > $goal_depth) {
+          break;
+        }
+        $stack_count += 1;
+        if (empty($call_stack['class'])) {
+          $stack_class = '';
+        }
+        else {
+          $stack_class = $call_stack['class'];
+        }
+        $stack_method =  $call_stack['function'];
+        array_push($stack, array("class" => $stack_class,
+                                 "method" => $stack_method));
+        // echo "[#] " . $stack_class . "::" . $stack_method . "\n";
+      }
+      // if(empty($stack) != FALSE){
+      //   $intended_reach[$stack_count]
+      // }
+
+      // if ($goal_gadgets[0]['method'] == '__wakeup' and
+      //     $stack[0]['method'] == 'unserialize') {
+      //   array_shift($stack);
+      //   $stack_count -= 1;
+      // }
+
+      // var_dump($stack);
+      // var_dump($goal_gadgets);
+
+      // $pass_flag = True;
+      // for ($i = 0; $i < $stack_count; $i++) {
+      //   if(!($stack[$i]['class'] == $goal_gadgets[$i]['class'] and
+      //      $stack[$i]['method'] == $goal_gadgets[$i]['method'])) {
+      //     $pass_flag = False;
+      //     break;
+      //   }
+      // }
+      $pass_flag = False;
+      $gadget_idx = 0;
+      for ($i = 0; $i < $stack_count; $i++) {
+        if ($gadget_idx < count($goal_gadgets)) {
+          if ($goal_gadgets[$gadget_idx]['class'] == $stack[$i]['class'] and
+              $goal_gadgets[$gadget_idx]['method'] == $stack[$i]['method']) {
+            $pass_flag = True;
+            $passed_gadgets['gadget_pass_check'][$gadget_idx] = True;
+            $gadget_idx += 1;
+          }
+        }
+      }
+
+      // if ($pass_flag) {
+      //   if (empty($passed_gadgets[$stack_count])) {
+      //     $passed_gadgets['gadget_pass_check'][$stack_count - 1] = True;
+      //   }
+      //   else {
+      //     echo "[!] NOTICE: Gadget was double passed! Please revise.\n";
+      //   }
+      // }
+    }
+
+    if ($sink_executed == True and
+        count($passed_gadgets['gadget_pass_check']) == count($chain) - 1) {
+      $passed_gadgets['sink_executed'] = True;
+    }
+
+    return $passed_gadgets;
+  }
+
+  private function GetSuffixName($obj_name) {
+    $redefined_obj_name = str_replace("\\", "_", $obj_name);
+    if (!array_key_exists($redefined_obj_name, $this->class_naming)) {
+      $this->class_naming[$redefined_obj_name] = 0;
+    }
+    else {
+      $this->class_naming[$redefined_obj_name]++;
+    }
+    return $this->class_naming[$redefined_obj_name];
+  }
+
+  private function makeSubObject($node, $obj_suffix, $argv_class_extends,
+                                 $argv_alias_list, $is_arrObj = False) {
+    $traverse_queue = array();
+    array_push($traverse_queue, array("node" => $node,
+                                      "parents" => array(),
+                                      "owner_class" => array(),
+                                      "class_paths" => array()));
+
+    $class_list = array();
+    $class_extends = $argv_class_extends;
+    $class_alias_list = $argv_alias_list;
+    $code_body = "";
+
+    if ($is_arrObj) {
+      $surface_obj_name = '$arrObj_' . $obj_suffix;
+    }
+    else {
+      $surface_obj_name = '$obj_';
+      $surface_obj_name .= str_replace("\\", "_", $node['value']);
+      $surface_obj_name .= "_" . $obj_suffix;
+    }
+    $sub_class_name = NULL;
+
+    while (count($traverse_queue) != 0) {
+      $is_prop_flag = False;
+      $is_array_obj = False;
+
+      $current_search = array_shift($traverse_queue);
+      if ($current_search['node']['type'] == "Object") {
+        if ($current_search['node']['value'] == '') {
+          $current_search['node']['value'] = $current_search['node']['info']->data->class;
+        }
+        if (!array_key_exists($current_search['node']['value'], $class_list)) {
+          $class_list[$current_search['node']['value']] = array();
+        }
+        if ($current_search['owner_class'] != NULL and
+            !array_key_exists($current_search['owner_class'], $class_list)) {
+          $class_list[$current_search['owner_class']] = array();
+        }
+      }
+      elseif ($current_search['node']['type'] == "ArrayObject") {
+        $is_arr_obj_process = False;
+        $is_array_obj = True;
+        $sub_code_body = "";
+        if ($current_search['node']['visibility'] == NULL) {
+          $prop_info['visibility'] = "public";
+        }
+        else {
+          $prop_info['visibility'] = $current_search['node']['visibility'];
+        }
+        $processing_prop_name = $this->GetPropertyKey($current_search['node']);
+        $processed_prop_name = $processing_prop_name['value'];
+        $prop_info['name'] = $processed_prop_name;
+        if (!is_array($current_search['owner_class'])) {
+          $class_list[$current_search['owner_class']][$prop_info['name']] = $prop_info;
+        }
+
+        foreach ($current_search['node']['value'] as $arr_index => $arr_body) {
+          $is_obj_body = False;
+          if (is_array($arr_body['arr_value']) and
+              array_key_exists("type", $arr_body['arr_value'])) {
+            $is_obj_body = True;
+            if ($arr_body['arr_value']['type'] == "Object") { // Obj in ArrObj
+              $sub_class_name = $arr_body['arr_value']['value'];
+              $sub_obj = $this->makeSubObject(
+                                  $arr_body['arr_value'],
+                                  $this->GetSuffixName($arr_body['arr_value']['value']),
+                                  $class_extends,
+                                  $class_alias_list
+                                );
+              $body_value = $sub_obj['surface_obj_name'];
+              $class_list = $class_list + $sub_obj['class_list'];
+              $class_extends = $class_extends + $sub_obj['class_extends'];
+            }
+          }
+          else { // Property in ArrObj
+            if (is_array($arr_body['arr_value'])) { // ArrObj in ArrayObj // FIXME
+              $first_key = array_keys($arr_body['arr_value'])[0];
+              if (is_array($arr_body['arr_value'][$first_key]) and
+                  array_key_exists('arr_key', $arr_body['arr_value'][$first_key]) and
+                  array_key_exists('arr_value', $arr_body['arr_value'][$first_key])) {
+                $parent_arrobj = new ArrayObject($current_search['node']);
+                $arrobj_in_arrobj = $parent_arrobj->getArrayCopy();
+                $arrobj_in_arrobj['value'] = $arr_body['arr_value'];
+
+                $sub_class_name = 'ArrObj';
+                $is_arr_obj_process = True;
+                $internal_sub_obj = $this->makeSubObject($arrobj_in_arrobj,
+                                                         $this->GetSuffixName('ArrObj'),
+                                                         $class_extends,
+                                                         $class_alias_list, True);
+                $sub_code_body .= $internal_sub_obj['code_body'];
+                $body_value = $internal_sub_obj['surface_obj_name'];
+                $class_list = $class_list + $internal_sub_obj['class_list'];
+                $class_extends = $class_extends + $internal_sub_obj['class_extends'];
+              }
+              else {
+                $body_value = var_export($arr_body['arr_value'], true);
+              }
+            }
+            else {
+              $body_value = var_export($arr_body['arr_value'], true);
+            }
+          }
+          if ($is_arrObj) {
+            $sub_code_body .= $surface_obj_name;
+            $sub_code_body .= '[' . var_export($arr_body['arr_key'], true). ']';
+            $sub_code_body .= ' = ' . $body_value . ";\n";
+          }
+          else {
+            $sub_code_body .= $surface_obj_name;
+            foreach ($current_search['class_paths'] as $class_path) {
+              $sub_code_body .= "->";
+              $sub_code_body .= "getProp('";
+              $sub_code_body .= $class_path . "')";
+            }
+            $sub_code_body .= "->";
+            $sub_code_body .= "setProp('";
+            $sub_code_body .= $processed_prop_name;
+            $sub_code_body .= "', ";
+            $sub_code_body .= $body_value;
+            $sub_code_body .= ", ";
+            $sub_code_body .= var_export($arr_body['arr_key'], true);
+            $sub_code_body .= ");\n";
+          }
+        }
+      }
+      else {
+        $is_prop_flag = True;
+        $prop_real_class = $current_search['node']['info']->data->real_class;
+        if (!array_key_exists($prop_real_class, $class_list)) {
+          $class_list[$prop_real_class] = array();
+        }
+      }
+
+      if ($is_prop_flag == True and $is_array_obj == False) { // Property
+        if ($current_search['node']['visibility'] == NULL) {
+          $prop_info['visibility'] = "public";
+        }
+        else {
+          $prop_info['visibility'] = $current_search['node']['visibility'];
+        }
+        $processing_prop_name = $this->GetPropertyKey($current_search['node']);
+        $processed_prop_name = $processing_prop_name['value'];
+        $prop_info['name'] = $processed_prop_name;
+
+        $class_list[$current_search['owner_class']][$prop_info['name']] = $prop_info;
+
+        $code_body .= "// case 0\n";
+        $code_body .= $surface_obj_name;
+        foreach ($current_search['class_paths'] as $class_path) {
+          $code_body .= "->";
+          $code_body .= "getProp('";
+          $code_body .= $class_path . "')";
+        }
+        $code_body .= "->";
+        $code_body .= "setProp('";
+        $code_body .= $processed_prop_name;
+        $code_body .= "', ";
+        $code_body .= $this->GetPropertyValue($current_search['node'])['value'];
+        $code_body .= ");\n";
+      }
+      elseif ($is_prop_flag == False and $is_array_obj == True) { // ArrayObj
+        if ($sub_class_name != 'ArrObj') {
+          $code_body .= "// case 1\n";
+          $code_body .= $sub_obj['surface_obj_name'];
+          $code_body .= ' = new ' . $sub_class_name . ";\n";
+          $code_body .= $sub_obj['code_body'];
+          $code_body .= $sub_code_body;
+        }
+        else {
+          $code_body .= "// case 2\n";
+          $code_body .= $internal_sub_obj['code_body'];
+          $code_body .= $sub_obj['code_body'];
+          $code_body .= $sub_code_body;
+        }
+      }
+      else { // Obj
+        if ($current_search['node']['name'] == '$this') {
+          $code_body .= "// case 3\n";
+          $code_body .= $surface_obj_name;
+          $code_body .= ' = new ' . $current_search['node']['value'] . ";\n";
+        }
+        else {
+          if ($current_search['node']['visibility'] == NULL) {
+            $prop_info['visibility'] = "public";
+          }
+          else {
+            $prop_info['visibility'] = $current_search['node']['visibility'];
+          }
+          $processing_prop_name = $this->GetPropertyKey($current_search['node']);
+          $processed_prop_name = $processing_prop_name['value'];
+          $prop_info['name'] = $processed_prop_name;
+
+          $class_list[$current_search['owner_class']][$prop_info['name']] = $prop_info;
+
+          $code_body .= "// case 4\n";
+          $code_body .= $surface_obj_name;
+          foreach ($current_search['class_paths'] as $class_path) {
+            $code_body .= "->";
+            $code_body .= "getProp('";
+            $code_body .= $class_path . "')";
+          }
+	        $code_body .= "->";
+          $code_body .= "setProp('";
+          $code_body .= $processed_prop_name;
+          $code_body .= "', ";
+          $code_body .= $this->GetPropertyValue($current_search['node'])['value'];
+          $code_body .= ");\n";
+        }
+      }
+
+      if (!empty($current_search['node']['deps'])) {
+        foreach ($current_search['node']['deps'] as $child_node) {
+          $new_node = array();
+          $new_node['node'] = $child_node;
+          $new_node['owner_class'] = $child_node['info']->data->real_class;
+
+          $before_class = $child_node['info']->data->class;
+          foreach ($child_node['info']->data->parents as $ext_class) {
+            if ($ext_class->TYPE == "CLASS" and
+                $ext_class->NAME != $child_node['info']->data->parents[0]->NAME) {
+              $class_extends[$before_class] = $ext_class;
+
+              if (!array_key_exists($before_class, $class_list)) {
+                $class_list[$before_class] = array();
+              }
+
+              $before_class = $ext_class->NAME;
+            }
+          }
+          $new_class_path = array();
+          if ($current_search['node']['name'] != '$this') {
+            $new_class_path = $current_search['class_paths'];
+            array_push($new_class_path, $current_search['node']['name']);
+          }
+          $new_node['class_paths'] = $new_class_path;
+          array_push($traverse_queue, $new_node);
+        }
+      }
+
+      if (isset($current_search['node']['info']->data->class_alias) and
+          $current_search['node']['info']->data->class_alias != '') {
+        $class_alias_list[$current_search['node']['value']] =
+                  $current_search['node']['info']->data->class_alias;
+      }
+    }
+
+    return array(
+      "class_list" => $class_list,
+      "code_body" => $code_body,
+      "class_extends" => $class_extends,
+      "surface_obj_name" => $surface_obj_name,
+      "class_alias_list" => $class_alias_list,
+    );
+  }
+
+  private function MakePayloadPhpFile($target_chain) {
+    $this->class_naming = array();
+    $objs = $this->makeSubObject(
+                    $this->input_tree['$this'],
+                    $this->GetSuffixName($this->input_tree['$this']['value']),
+                    array(),
+                    array()
+                  );
+    $root_obj = $objs['surface_obj_name'];
+    $class_list = $objs['class_list'];
+    $code_body = $objs['code_body'];
+    $class_extends = $objs['class_extends'];
+    $class_alias_list = $objs['class_alias_list'];
+
+    $gadget_parents = array();
+    foreach ($target_chain as $gadget) {
+      for ($parent_order = 0; $parent_order < count($gadget->parents); $parent_order++) {
+        $parent_name = $gadget->parents[$parent_order]->NAME;
+        $next_parent = array(
+          "TYPE" => NULL,
+          "NAME" => NULL,
+          "FILE" => NULL
+        );
+        if (array_key_exists($parent_order+1, $gadget->parents)) {
+          $next_parent = $gadget->parents[$parent_order+1];
+        }
+        $gadget_parents[$parent_name] = $next_parent;
+      }
+    }
+
+    $code_head = "<?php\n";
+    $written_class = array();
+    $will_write_class = $class_list;
+
+    while (count($class_list) != count($written_class)) {
+      $before_class = array_keys($will_write_class)[0];
+      if (array_key_exists($before_class, $class_extends)) {
+        $next_class = $class_extends[$before_class]->NAME;
+      }
+      else {
+        $next_class = NULL;
+      }
+
+      $class_name = $this->GetNextWriteClass($before_class, $next_class,
+                                             $written_class, $class_extends);
+      $full_class_name = $class_name;
+
+      $class_props = $class_list[$class_name];
+
+      unset($will_write_class[$class_name]);
+      $written_class[$class_name] = True;
+
+      if (array_key_exists($class_name, $class_alias_list)) {
+        continue;
+      }
+
+      if (strpos($class_name, "\\") == FALSE) {
+        $namespace = "";
+      }
+      else {
+        $class_name_with_namespace = explode("\\", $class_name);
+        $namespace = join("\\", array_slice($class_name_with_namespace, 0, -1));
+        $class_name = end($class_name_with_namespace);
+      }
+
+      $ext_string = '';
+      $construct_string = '';
+      if (array_key_exists($full_class_name, $class_extends)) {
+        if ($class_extends[$full_class_name]->TYPE == "CLASS") {
+          $ext_string = " extends \\" . $class_extends[$full_class_name]->NAME;
+        }
+      }
+      else {
+        if (array_key_exists($full_class_name, $gadget_parents) and
+            is_object($gadget_parents[$full_class_name]) and
+            $gadget_parents[$full_class_name]->NAME != NULL and
+            $gadget_parents[$full_class_name]->FILE == "INTERNAL") {
+          if ($gadget_parents[$full_class_name]->TYPE == "CLASS") {
+            $ext_string = " extends \\" . $gadget_parents[$full_class_name]->NAME;
+            if ($gadget_parents[$full_class_name]->NAME == "ArrayIterator") {
+              $construct_string = 'function __construct(){' . "\n";
+              $construct_string .= 'parent::__construct(["DummyKey" => "DummyValue"]);';
+              $construct_string .= "\n}" . "\n";
+            }
+          }
+          // elseif ($gadget_parents[$full_class_name]->TYPE == "INTERFACE") {
+          //   if ($gadget_parents[$full_class_name]->NAME == "Iterator") {
+          //   }
+          // }
+        }
+      }
+      $code_head .= "namespace " . $namespace . " {\n";
+      $code_head .= "class " . $class_name . $ext_string . "{\n";
+      foreach ($class_props as $class_prop) {
+        $code_head .= $class_prop['visibility'];
+        $code_head .= " $" .$class_prop['name'] .";\n";
+      }
+      $code_head .= $construct_string;
+      $code_head .= 'function setProp($name, $value, $arr_key = NULL){' . "\n";
+      $code_head .= '$parent_class = get_parent_class();' . "\n";
+      $code_head .= 'if($parent_class &&' . "\n";
+      $code_head .= 'property_exists($parent_class, $name)){' . "\n";
+      $code_head .= 'parent::setProp($name, $value, $arr_key);' . "\n";
+      $code_head .= "}\n";
+      $code_head .= 'if($arr_key == NULL){' . "\n";
+      $code_head .= '$this->$name = $value;' . "\n";
+      $code_head .= "}\n";
+      $code_head .= "else{\n";
+      $code_head .= 'if(property_exists($this, $name)){' ."\n";
+      $code_head .= '$this->$name = (array) $this->$name + array($arr_key => $value);' . "\n";
+      $code_head .= "}\n";
+      $code_head .= 'else{' ."\n";
+      $code_head .= '$this->$name = array($arr_key = $value);' ."\n";
+      $code_head .= "}\n";
+      $code_head .= "}\n";
+      $code_head .= "}\n";
+      $code_head .= 'function getProp($name){' . "\n";
+      $code_head .= 'return $this->$name;' . "\n"; // Need to return both of them?
+      $code_head .= "}\n";
+      $code_head .= "}\n";
+      $code_head .= "}\n";
+    }
+
+    foreach($class_alias_list as $class_name => $aliased_class) {
+      $code_head .= "namespace {\n";
+      $code_head .= "class_alias('" . $aliased_class . "', '" . $class_name . "');\n";
+      $code_head .= "}\n";
+    }
+
+    $code_body = "namespace {\n" . $code_body . "}\n";
+
+    $code_tail = "namespace {\n";
+    $code_tail .= 'echo base64_encode(serialize(' . $root_obj . '));' . "\n";
+    $code_tail .= "}\n?>";
+
+    $code_full = $code_head . $code_body . $code_tail;
+    $this->payload_file_contents = $code_full;
+
+    $payload_path = $this->inst_file_path . "PAYLOAD/" . $this->inst_file_name;
+    file_put_contents($payload_path, $this->payload_file_contents);
+    return $payload_path;
+  }
+
+  private function GetNextWriteClass($before_class, $next_class,
+                                     $written_class, $class_extends) {
+    if (array_key_exists($next_class, $written_class)) {
+      return $before_class;
+    }
+    else {
+      if (array_key_exists($next_class, $class_extends)) {
+        $ext_class = $class_extends[$next_class]->NAME;
+        return $this->GetNextWriteClass($next_class, $ext_class,
+                                        $written_class, $class_extends);
+      }
+      else {
+        if ($next_class == NULL) {
+          return $before_class;
+        }
+        else {
+          return $next_class;
+        }
+      }
+    }
+  }
+
+  private function GetRandomString() {
+    $characters = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    $random_string = '';
+    $string_length = rand(1, MAX_STR_LENGTH);
+
+    for ($i = 0; $i < $string_length; $i++) {
+      $index = rand(0, strlen($characters) - 1);
+      $random_string .= $characters[$index];
+    }
+    return $random_string;
+  }
+
+  private function GetPropertyKey($prop) {
+    if (substr($prop['name'], 0, 1) == "$") {
+      return array('value' => $this->GetRandomString(), 'rand' => True);
+    }
+    else {
+      return array('value' => $prop['name'], 'rand' => False);
+    }
+  }
+
+  private function GetPropertyValue($prop){
+    if ($prop['type'] == "Object") {
+      return array('value' => "new " . $prop['value'], 'rand' => False);
+    }
+    else {
+      if (gettype($prop['value']) == 'boolean') {
+        if ($prop['value']) {
+          return array('value' => "true", 'rand' => False);
+        }
+        else {
+          return array('value' => "false", 'rand' => False);
+        }
+      }
+      else if (gettype($prop['value']) == 'string') {
+        return array('value' => "\"" . $prop['value'] . "\"", 'rand' => False);
+      }
+      else if (gettype($prop['value']) == 'array') {
+        return array('value' => var_export($prop['value'], True), 'rand' => False);
+      }
+      else if (gettype($prop['value']) == NULL) {
+        return array('value' => NULL, 'rand' => False);
+      }
+      else {
+        return array('value' => $prop['value'], 'rand' => False);
+      }
+    }
+  }
+}
