@@ -1,0 +1,18 @@
+[submodule "Lib/php-jsond"]
+	path = Lib/php-jsond
+	url = https://github.com/bukka/php-jsond
+[submodule "Lib/runkit"]
+	path = Lib/runkit
+	url = https://github.com/zenovich/runkit
+[submodule "Lib/uopz"]
+	path = Lib/uopz
+	url = https://github.com/krakjoe/uopz
+[submodule "Lib/uopz7"]
+	path = Lib/uopz7
+	url = https://github.com/krakjoe/uopz
+[submodule "Lib/PHP-Parser"]
+	path = Lib/PHP-Parser
+	url = https://github.com/nikic/PHP-Parser
+[submodule "Lib/PHP-Parser7"]
+	path = Lib/PHP-Parser7
+	url = https://github.com/nikic/PHP-Parser
