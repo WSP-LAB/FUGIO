@@ -31,4 +31,5 @@ grep -qF -- "extension=evalhook.so" /etc/php/5.6/apache2/php.ini || echo "extens
 grep -qF -- "extension=uopz.so" /etc/php/5.6/apache2/php.ini || echo "extension=uopz.so" >> /etc/php/5.6/apache2/php.ini
 grep -qF -- "extension=uopz.so" /etc/php/5.6/cli/php.ini || echo "extension=uopz.so" >> /etc/php/5.6/cli/php.ini
 grep -qF -- "extension=pcntl.so" /etc/php/5.6/apache2/php.ini || echo "extension=pcntl.so" >> /etc/php/5.6/apache2/php.ini
-
+sed -i "s/^disable_functions/; disable_functions/g" /etc/php/5.6/apache2/php.ini
+sed -i "s/;phar.readonly = On/phar.readonly = Off/g" /etc/php/5.6/cli/php.ini

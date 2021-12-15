@@ -45,3 +45,4 @@ grep -qF -- "extension=pcntl.so" /usr/local/lib/php.ini || echo "extension=pcntl
 grep -qF -- "extension=jsond.so" /usr/local/lib/php.ini || echo "extension=jsond.so" >> /usr/local/lib/php.ini
 grep -qF -- "; extension=runkit.so" /usr/local/lib/php.ini || echo "; extension=runkit.so" >> /usr/local/lib/php.ini
 grep -qF -- "; runkit.internal_override=1" /usr/local/lib/php.ini || echo "; runkit.internal_override=1" >> /usr/local/lib/php.ini
+sed -i "s/;phar.readonly = On/phar.readonly = Off/g" /usr/local/lib/php.ini
