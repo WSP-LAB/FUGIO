@@ -15,7 +15,7 @@ For more details, please refer to our [paper](https://www.usenix.org/conference/
 FUGIO is tested on a machine running Ubuntu 18.04. Python 3 and PHP (5.4, 5.6, or 7.2) are required to run FUGIO.
 We provide three Docker images depending on PHP versions in [FUGIO-artifact](https://github.com/WSP-LAB/FUGIO-artifact).
 If you use the given Docker images, follow the instructions in [Prepare Docker containers](https://github.com/WSP-LAB/FUGIO-artifact#prepare-docker-containers)
-and then go to the [phase 2]().
+and then go to the [phase 2](https://github.com/WSP-LAB/FUGIO#phase-2).
 
 ### Phase 1
 * Clone git repo
