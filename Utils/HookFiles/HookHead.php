@@ -151,11 +151,13 @@ function get_class_props_r353t($clsname) {
   return $class_props;
 }
 
-function get_user_classes_r353t() {
+function get_user_classes_r353t($trigger_func, $func_argv) {
   $user_classes = Array();
-  $declared_list = array_merge(get_declared_classes(),
-                               get_declared_interfaces());
-  $declared_list = array_merge($declared_list, get_declared_traits());
+  $declared_list = array_merge(get_declared_classes(), get_declared_interfaces());
+  $declared_list = filter_allowed_classes(
+    array_merge($declared_list, get_declared_traits()),
+    $trigger_func,
+    $func_argv);
   foreach ($declared_list as $clsname) {
     $cls = new ReflectionClass($clsname);
     $cls_org = $cls;
@@ -251,9 +253,9 @@ function isPharDetected_r353t($case, $validator_md5) {
   return False;
 }
 
-function get_declared_classes_r353t() {
+function get_declared_classes_r353t($trigger_func, $func_argv) {
   $declared_classes = array();
-  foreach (get_declared_classes() as $clsname) {
+  foreach (filter_allowed_classes(get_declared_classes(), $trigger_func, $func_argv) as $clsname) {
     $cls = new \ReflectionClass($clsname);
     $clsname = str_replace("\0", "", $clsname);
     $clsname = str_replace("/", "_", $clsname);
@@ -284,6 +286,25 @@ function get_declared_traits_r353t() {
     $traits[$traitname] = array("INTERNAL" => $reflect->isInternal(), "FILE" => $reflect->getFileName());
   }
   return $traits;
+}
+
+function filter_allowed_classes($array, $trigger_func, $func_argv) {
+  $return_array = $array;
+  if ($trigger_func == "unserialize" && count($func_argv) > 1) {
+      if (array_key_exists("allowed_classes", $func_argv[1])) {
+          if (gettype($func_argv[1]["allowed_classes"]) == "boolean") {
+              if ($func_argv[1]["allowed_classes"] == false) {
+                  $return_array = Array();
+              } else if ($func_argv[1]["allowed_classes"] == true) {
+                  $return_array = $array;
+              }
+          } else if (gettype($func_argv[1]["allowed_classes"]) == "array") {
+              $allowed_classes = $func_argv[1]["allowed_classes"];
+              $return_array = array_intersect($array, $allowed_classes);
+          }
+      }
+  }
+  return $return_array;
 }
 
 function saveDatas_r353t($argv_list, $trigger_func, $func_argv, $inject_idxs) {
@@ -323,6 +344,21 @@ function saveDatas_r353t($argv_list, $trigger_func, $func_argv, $inject_idxs) {
   $class_name_list = Array('{{__CLASS_LIST__}}');
   $class_list = Array();
   $pid_list = Array();
+
+  if ($trigger_func == "unserialize" && count($func_argv) > 1) {
+      if (array_key_exists("allowed_classes", $func_argv[1])) {
+          if (gettype($func_argv[1]["allowed_classes"]) == "boolean") {
+              if ($func_argv[1]["allowed_classes"] == false) {
+                  $class_name_list = Array();
+              } else if ($func_argv[1]["allowed_classes"] == true) {
+                  $class_name_list = $class_name_list;
+              }
+          } else if (gettype($func_argv[1]["allowed_classes"]) == "array") {
+              $allowed_classes = $func_argv[1]["allowed_classes"];
+              $class_name_list = array_intersect($class_name_list, $allowed_classes);
+          }
+      }
+  }
 
   foreach($class_name_list as $cls_name) {
     $pid = pcntl_fork();
@@ -396,10 +432,10 @@ function saveDatas_r353t($argv_list, $trigger_func, $func_argv, $inject_idxs) {
 
   $argv_list_r353t['TRIGGER_FUNC'] = $trigger_func;
   $argv_list_r353t['FUNC_ARGV'] = $func_argv;
-  $argv_list_r353t['CLASSES'] = get_declared_classes_r353t();
+  $argv_list_r353t['CLASSES'] = get_declared_classes_r353t($trigger_func, $func_argv);
   $argv_list_r353t['INTERFACES'] = get_declared_interfaces_r353t();
   $argv_list_r353t['TRAITS'] = get_declared_traits_r353t();
-  $argv_list_r353t['USER_CLASSES'] = get_user_classes_r353t();
+  $argv_list_r353t['USER_CLASSES'] = get_user_classes_r353t($trigger_func, $func_argv);
   $argv_list_r353t['INCLUDED_FILES'] = get_included_files();
   $copied_globals = new ArrayObject($GLOBALS);
   $argv_list_r353t['GLOBALS'] = $copied_globals->getArrayCopy();
