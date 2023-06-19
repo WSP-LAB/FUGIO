@@ -124,6 +124,9 @@ class DynamicAnalyzer:
                 new_func_info['FILE_NAME'] = func_file
                 target_function[func_name] = new_func_info
 
+        if not user_classes:
+            return target_class, target_function
+
         for class_name, class_info in user_classes.items():
             if not re.match(EXCLUDED_CLASSES_REGEX, class_name):
                 file_name = class_info['FILE_NAME']
