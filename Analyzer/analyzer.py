@@ -386,6 +386,10 @@ class Analyzer:
             f.write(b'?>')
         self.target_file_list = self.s_analyzer.parse_file(EVAL_FILE)
 
+        # If PHP returns an empty array, Python treats it as a list.
+        if isinstance(user_classes, list):
+            user_classes = {}
+
         target_class, target_function = \
                         self.d_analyzer.update_info(user_classes,
                                                     user_functions,
@@ -1153,6 +1157,11 @@ class Analyzer:
         class_list = []
 
         declared_flag = False
+
+        # If PHP returns an empty array, Python treats it as a list.
+        if isinstance(user_classes, list):
+            user_classes = {}
+
         for class_name, class_info in user_classes.items():
             if not re.match(EXCLUDED_CLASSES_REGEX, class_name) and \
                class_info['FILE_NAME'].startswith(self.target):

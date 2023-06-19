@@ -124,8 +124,9 @@ class DynamicAnalyzer:
                 new_func_info['FILE_NAME'] = func_file
                 target_function[func_name] = new_func_info
 
-        if not user_classes:
-            return target_class, target_function
+        # If PHP returns an empty array, Python treats it as a list.
+        if isinstance(user_classes, list):
+            user_classes = {}
 
         for class_name, class_info in user_classes.items():
             if not re.match(EXCLUDED_CLASSES_REGEX, class_name):
