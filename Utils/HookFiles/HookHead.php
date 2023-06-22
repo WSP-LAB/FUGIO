@@ -290,7 +290,7 @@ function get_declared_traits_r353t() {
 
 function filter_allowed_classes($array, $trigger_func, $func_argv) {
   $return_array = $array;
-  if ($trigger_func == "unserialize" && count($func_argv) > 1) {
+  if (($trigger_func == "unserialize" || $trigger_func == "fugio_unserialize") && count($func_argv) > 1) {
       if (array_key_exists("allowed_classes", $func_argv[1])) {
           if (gettype($func_argv[1]["allowed_classes"]) == "boolean") {
               if ($func_argv[1]["allowed_classes"] == false) {
