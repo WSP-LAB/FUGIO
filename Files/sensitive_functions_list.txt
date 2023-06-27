@@ -2,7 +2,6 @@
 
 
 unserialize|1
-fugio_unserialize|1
 # ==== NEED TO SET VULN INJECT POINT NUMBERS!! ====
 copy|1
 file_exists|1
